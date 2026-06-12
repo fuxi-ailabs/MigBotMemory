@@ -1,4 +1,17 @@
-"""Pattern data models — the core domain objects."""
+"""Data models — Task lifecycle as the memory unit.
+
+Memory unit = a feature's complete migration cycle:
+  task → plan → execute → verify → commit
+
+Compression levels:
+  - Tool: compress tool outputs into structured data
+  - Session: split by phase boundaries, summarize each phase, build index
+  - Task: compress full lifecycle into concise record (~200 tokens)
+
+Quality-based categorization (no confidence scores):
+  - reference: outcome=success → always injected
+  - trial: outcome=partial/failed → on lookup
+"""
 
 from __future__ import annotations
 
@@ -9,8 +22,43 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 
-class Category(str, enum.Enum):
-    """Error pattern classification."""
+# ── Lifecycle phases ─────────────────────────────────────────────
+
+class Phase(str, enum.Enum):
+    """Feature migration lifecycle phases."""
+    task = "task"        # 功能定义：what to migrate
+    plan = "plan"        # 设计：migration approach, spec
+    execute = "execute"  # 实现：code generation, conversion
+    verify = "verify"    # 测试：compile, lint, visual, functional
+    commit = "commit"    # 提交：finalize, update state
+
+
+# ── Outcome & quality ────────────────────────────────────────────
+
+class Outcome(str, enum.Enum):
+    """Task completion outcome."""
+    success = "success"    # compile pass, verify pass
+    partial = "partial"    # compile pass, some issues remain
+    failed = "failed"      # compile fail or critical issues
+
+
+class QualityMetrics(BaseModel):
+    """Task completion quality — the real measure, not confidence."""
+    compile_pass: bool = False
+    lint_errors: int = 0
+    lint_warnings: int = 0
+    test_pass: bool = False
+    verify_pass: bool = False
+
+    def overall_ok(self) -> bool:
+        """Is this a reference-quality task?"""
+        return self.compile_pass and self.verify_pass and self.lint_errors == 0
+
+
+# ── Error category ───────────────────────────────────────────────
+
+class ErrorCategory(str, enum.Enum):
+    """Error classification for key_errors field."""
     syntax_error = "syntax_error"
     type_mismatch = "type_mismatch"
     missing_import = "missing_import"
@@ -19,127 +67,113 @@ class Category(str, enum.Enum):
     duplicate_identifier = "duplicate_identifier"
 
 
-class Tier(str, enum.Enum):
-    """Progressive disclosure tier."""
-    deterministic = "deterministic"
-    probabilistic = "probabilistic"
-    empirical = "empirical"
+# ── Core models ──────────────────────────────────────────────────
 
+class TaskRecord(BaseModel):
+    """A complete feature migration lifecycle — the memory unit.
 
-class FixStrategy(str, enum.Enum):
-    """Fix template strategy."""
-    bracket_assignment = "bracket_assignment"
-    regex_replace = "regex_replace"
-    import_replacement = "import_replacement"
-    explicit_cast = "explicit_cast"
-    add_declaration = "add_declaration"
-    rename_identifier = "rename_identifier"
-
-
-class FixTemplate(BaseModel):
-    """Lossless fix information — preserved fully, disclosed progressively."""
-    strategy: FixStrategy
-    before: str = Field(description="Wrong code example")
-    after: str = Field(description="Correct code example")
-    description: Optional[str] = Field(
-        default=None,
-        description="Optional human-readable explanation of the fix logic",
-    )
-
-
-class Pattern(BaseModel):
-    """A single error pattern with lossless compression structure.
-
-    Three information density layers:
-    - title  (~15 tokens) → used in index layer
-    - facts  (~50 tokens) → used in Tier 2 injection
-    - fix_template (complete) → full disclosure in Tier 1, on-demand in Tier 2/3
+    Three compression layers in one record:
+    - summaries (task/plan/execute/verify/commit): ~50 tokens each → session level
+    - key_decisions/errors/fixes: concise lists → task level
+    - full record preserved in JSON file → lossless, on lookup
     """
-    id: str = Field(description="Unique pattern identifier, e.g. 'arkts-valuesbucket-bracket'")
-    signature: str = Field(
-        description="Regex pattern for matching this error in build output",
+    id: str = Field(description="Task identifier, e.g. 'login-page-migration'")
+    domain: str = Field(description="Migration domain, e.g. 'android-to-harmonyos'")
+    feature: str = Field(description="What was migrated, e.g. 'LoginActivity'")
+    source: str = Field(description="Source file/component")
+    target: str = Field(description="Target file/component")
+
+    # ── Phase summaries (session compression: split + summarize) ──
+    task_summary: str = Field(
+        default="", description="What was defined (~50 tokens)",
     )
-    domain: str = Field(
-        description="Migration domain, e.g. 'android-to-harmonyos'",
+    plan_summary: str = Field(
+        default="", description="Design decisions (~50 tokens)",
     )
-    category: Category
-    title: str = Field(description="Short human-readable description, 5-15 tokens")
-    facts: list[str] = Field(
+    execute_summary: str = Field(
+        default="", description="Implementation approach (~50 tokens)",
+    )
+    verify_summary: str = Field(
+        default="", description="Test/verification results (~50 tokens)",
+    )
+    commit_summary: str = Field(
+        default="", description="What was committed (~30 tokens)",
+    )
+
+    # ── Key artifacts (task compression: the reusable knowledge) ──
+    key_decisions: list[str] = Field(
         default_factory=list,
-        description="Concise standalone statements, no pronouns, include specific values. ~50 tokens total.",
+        description="Important decisions made during migration",
     )
-    fix_template: FixTemplate
-    confidence: float = Field(
-        ge=0.0, le=1.0,
-        description="Pattern confidence: 0.5=empirical, 0.7=probabilistic, 1.0=deterministic",
+    key_errors: list[str] = Field(
+        default_factory=list,
+        description="Significant errors encountered (with category)",
     )
-    occurrences: int = Field(default=1, ge=1, description="Number of times this pattern was observed")
-    auto_apply: bool = Field(default=False, description="Whether to auto-apply this fix without LLM reasoning")
+    key_fixes: list[str] = Field(
+        default_factory=list,
+        description="How errors were fixed",
+    )
+
+    # ── Outcome & quality ──
+    outcome: Outcome = Outcome.failed
+    quality: QualityMetrics = Field(default_factory=QualityMetrics)
+
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    last_seen_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    completed_at: Optional[datetime] = None
 
     @property
-    def tier(self) -> Tier:
-        """Derive tier from confidence."""
-        if self.confidence >= 1.0:
-            return Tier.deterministic
-        if self.confidence >= 0.7:
-            return Tier.probabilistic
-        return Tier.empirical
-
-    def promote(self) -> Pattern:
-        """Promote pattern: empirical→probabilistic→deterministic."""
-        if self.confidence < 0.7:
-            new_confidence = 0.7
-            new_auto_apply = False
-        elif self.confidence < 1.0:
-            new_confidence = 1.0
-            new_auto_apply = True
-        else:
-            return self  # already at top tier
-        return self.model_copy(update={
-            "confidence": new_confidence,
-            "auto_apply": new_auto_apply,
-            "occurrences": self.occurrences + 1,
-            "last_seen_at": datetime.now(timezone.utc),
-        })
-
-    def demote(self) -> Pattern:
-        """Demote pattern back to empirical (inconsistent fix detected)."""
-        return self.model_copy(update={
-            "confidence": 0.5,
-            "auto_apply": False,
-            "occurrences": 1,
-            "last_seen_at": datetime.now(timezone.utc),
-        })
+    def category(self) -> str:
+        """Quality-based categorization: reference or trial."""
+        if self.outcome == Outcome.success and self.quality.overall_ok():
+            return "reference"
+        return "trial"
 
 
-class MappingEntry(BaseModel):
-    """An import/API replacement mapping."""
-    old: str = Field(description="Original import/API, e.g. '@ohos.data.rdb'")
-    new: str = Field(description="Replacement import/API, e.g. '@kit.ArkData'")
-    domain: str
-    strategy: FixStrategy = FixStrategy.import_replacement
+# ── Skill invocation event (tool compression layer) ──────────────
+
+class SkillEvent(BaseModel):
+    """A skill invocation captured by PostToolUse hook — the raw input for compression."""
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    skill_name: str = Field(description="Which skill was invoked, e.g. 'a2h-execute'")
+    skill_args: Optional[str] = Field(default=None, description="Arguments passed to the skill")
+    phase: Optional[Phase] = Field(
+        default=None, description="Lifecycle phase this skill maps to",
+    )
+    output_summary: Optional[str] = Field(
+        default=None, description="Compressed output of the skill invocation",
+    )
 
 
-class IndexEntry(BaseModel):
-    """A single entry in the pattern index."""
-    tier: Tier
-    pattern_id: str
+# ── Index (session compression: index layer) ─────────────────────
 
+class TaskIndex(BaseModel):
+    """Index for fast lookup: task_id → {feature, outcome, quality_snapshot}."""
+    entries: dict[str, dict] = Field(default_factory=dict)
 
-class PatternIndex(BaseModel):
-    """Cross-tier index: signature → IndexEntry for fast lookup."""
-    entries: dict[str, IndexEntry] = Field(default_factory=dict)
+    def upsert(self, task_id: str, feature: str, outcome: Outcome, quality: QualityMetrics) -> None:
+        self.entries[task_id] = {
+            "feature": feature,
+            "outcome": outcome.value,
+            "compile_pass": quality.compile_pass,
+            "verify_pass": quality.verify_pass,
+            "lint_errors": quality.lint_errors,
+        }
 
-    def lookup(self, signature: str) -> Optional[IndexEntry]:
-        """Find which tier and pattern_id a signature maps to."""
-        return self.entries.get(signature)
+    def remove(self, task_id: str) -> None:
+        self.entries.pop(task_id, None)
 
-    def upsert(self, signature: str, tier: Tier, pattern_id: str) -> None:
-        """Add or update an index entry."""
-        self.entries[signature] = IndexEntry(tier=tier, pattern_id=pattern_id)
+    def list_reference(self) -> list[dict]:
+        """List all reference-quality tasks."""
+        return [
+            {"id": k, **v}
+            for k, v in self.entries.items()
+            if v.get("outcome") == Outcome.success.value
+        ]
 
-    def remove(self, signature: str) -> None:
-        """Remove an index entry."""
-        self.entries.pop(signature, None)
+    def list_trial(self) -> list[dict]:
+        """List all trial (partial/failed) tasks."""
+        return [
+            {"id": k, **v}
+            for k, v in self.entries.items()
+            if v.get("outcome") != Outcome.success.value
+        ]

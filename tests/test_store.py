@@ -1,19 +1,17 @@
-"""Tests for PatternStore — JSON file CRUD, index, promote, atomic writes."""
+"""Tests for TaskStore — task lifecycle CRUD, events, index, archive."""
 
 import json
-import tempfile
 from pathlib import Path
 
 import pytest
 
 from mbm.config import MBMConfig
-from mbm.models import Category, FixStrategy, FixTemplate, Pattern, PatternIndex, Tier
-from mbm.store import PatternStore
+from mbm.models import Outcome, Phase, QualityMetrics, SkillEvent, TaskIndex, TaskRecord
+from mbm.store import TaskStore
 
 
 @pytest.fixture
 def tmp_config(tmp_path: Path) -> MBMConfig:
-    """Create a temporary MBMConfig pointing to tmp_path/.mbm."""
     mbm_dir = tmp_path / ".mbm"
     config = MBMConfig(domain="test-domain", mbm_dir=str(mbm_dir))
     config.save()
@@ -21,185 +19,166 @@ def tmp_config(tmp_path: Path) -> MBMConfig:
 
 
 @pytest.fixture
-def store(tmp_config: MBMConfig) -> PatternStore:
-    """Create an initialized PatternStore."""
-    s = PatternStore(tmp_config)
-    s.init_store()
-    return s
+def store(tmp_config: MBMConfig) -> TaskStore:
+    return TaskStore(tmp_config)
 
 
-def make_pattern(
-    id: str = "test-pattern-1",
-    signature: str = "test-error-sig",
-    domain: str = "test-domain",
-    category: Category = Category.syntax_error,
-    title: str = "Test pattern",
-    confidence: float = 0.5,
-    occurrences: int = 1,
-) -> Pattern:
-    return Pattern(
+def make_task(
+    id: str = "login-page",
+    feature: str = "LoginActivity",
+    source: str = "LoginActivity.java",
+    target: str = "LoginPage.ets",
+    outcome: Outcome = Outcome.success,
+    compile_pass: bool = True,
+    verify_pass: bool = True,
+    lint_errors: int = 0,
+) -> TaskRecord:
+    return TaskRecord(
         id=id,
-        signature=signature,
-        domain=domain,
-        category=category,
-        title=title,
-        facts=["Test fact 1", "Test fact 2"],
-        fix_template=FixTemplate(
-            strategy=FixStrategy.bracket_assignment,
-            before="wrong code",
-            after="correct code",
-            description="Test fix description",
-        ),
-        confidence=confidence,
-        occurrences=occurrences,
+        domain="test-domain",
+        feature=feature,
+        source=source,
+        target=target,
+        task_summary="Migrate LoginActivity with login form and password validation",
+        plan_summary="Use Column + TextInput, preserve form validation logic",
+        execute_summary="Converted XML layout to Column, kept validation as separate method",
+        verify_summary="Compile pass, visual match 95%",
+        commit_summary="5 files committed, 3 pages + 2 helpers",
+        key_decisions=["Use Column instead of LinearLayout", "Keep validation as pure function"],
+        key_errors=["arkts-identifiers-as-prop-names in ValuesBucket"],
+        key_fixes=["Bracket assignment: bucket['key'] = value"],
+        outcome=outcome,
+        quality=QualityMetrics(compile_pass=compile_pass, verify_pass=verify_pass, lint_errors=lint_errors),
     )
 
 
 class TestStoreInit:
-    def test_init_creates_dirs(self, tmp_config: MBMConfig) -> None:
-        store = PatternStore(tmp_config)
-        store.init_store()
-        assert tmp_config.patterns_dir.exists()
+    def test_creates_dirs(self, tmp_config: MBMConfig) -> None:
+        store = TaskStore(tmp_config)
+        assert tmp_config.raw_dir.exists()
+        assert tmp_config.reference_dir.exists()
+        assert tmp_config.trial_dir.exists()
         assert tmp_config.context_dir.exists()
-        assert tmp_config.sessions_dir.exists()
-
-    def test_init_creates_files(self, store: PatternStore) -> None:
-        assert (store.config.patterns_dir / "deterministic.json").exists()
-        assert (store.config.patterns_dir / "probabilistic.json").exists()
-        assert (store.config.patterns_dir / "empirical.jsonl").exists()
-        assert (store.config.patterns_dir / "mappings.json").exists()
-        assert (store.config.patterns_dir / "index.json").exists()
-
-    def test_init_with_seed_patterns(self, tmp_config: MBMConfig) -> None:
-        seeds = [make_pattern(id="seed-1", confidence=1.0)]
-        store = PatternStore(tmp_config)
-        store.init_store(seed_patterns=seeds)
-        patterns = store.read_all()
-        assert len(patterns) == 1
-        assert patterns[0].id == "seed-1"
 
 
-class TestStoreWrite:
-    def test_write_empirical(self, store: PatternStore) -> None:
-        p = make_pattern(confidence=0.5)
-        store.write(p)
-        empirical = store._read_tier(Tier.empirical)
-        assert len(empirical) == 1
-        assert empirical[0].id == p.id
+class TestTaskCRUD:
+    def test_write_reference_task(self, store: TaskStore) -> None:
+        task = make_task(outcome=Outcome.success)
+        store.write_task(task)
+        assert (store.config.reference_dir / "login-page.json").exists()
 
-    def test_write_probabilistic(self, store: PatternStore) -> None:
-        p = make_pattern(confidence=0.8)
-        store.write(p)
-        probabilistic = store._read_tier(Tier.probabilistic)
-        assert len(probabilistic) == 1
-        assert probabilistic[0].id == p.id
+    def test_write_trial_task(self, store: TaskStore) -> None:
+        task = make_task(id="chat-page", outcome=Outcome.partial, compile_pass=True, verify_pass=False)
+        store.write_task(task)
+        assert (store.config.trial_dir / "chat-page.json").exists()
 
-    def test_write_deterministic(self, store: PatternStore) -> None:
-        p = make_pattern(confidence=1.0)
-        store.write(p)
-        deterministic = store._read_tier(Tier.deterministic)
-        assert len(deterministic) == 1
-        assert deterministic[0].id == p.id
+    def test_read_task(self, store: TaskStore) -> None:
+        task = make_task()
+        store.write_task(task)
+        loaded = store.read_task("login-page")
+        assert loaded is not None
+        assert loaded.id == "login-page"
+        assert loaded.outcome == Outcome.success
+        assert loaded.feature == "LoginActivity"
 
-    def test_write_updates_index(self, store: PatternStore) -> None:
-        p = make_pattern(signature="test-sig-123")
-        store.write(p)
+    def test_read_nonexistent(self, store: TaskStore) -> None:
+        assert store.read_task("nonexistent") is None
+
+    def test_read_all_tasks(self, store: TaskStore) -> None:
+        t1 = make_task(id="ref-1", outcome=Outcome.success)
+        t2 = make_task(id="trial-1", outcome=Outcome.failed)
+        store.write_task(t1)
+        store.write_task(t2)
+        all_tasks = store.read_all_tasks()
+        assert len(all_tasks) == 2
+
+    def test_read_reference_tasks(self, store: TaskStore) -> None:
+        t1 = make_task(id="ref-1", outcome=Outcome.success)
+        t2 = make_task(id="trial-1", outcome=Outcome.failed)
+        store.write_task(t1)
+        store.write_task(t2)
+        ref_tasks = store.read_reference_tasks()
+        assert len(ref_tasks) == 1
+        assert ref_tasks[0].id == "ref-1"
+
+    def test_read_trial_tasks(self, store: TaskStore) -> None:
+        t1 = make_task(id="ref-1", outcome=Outcome.success)
+        t2 = make_task(id="trial-1", outcome=Outcome.failed)
+        store.write_task(t1)
+        store.write_task(t2)
+        trial_tasks = store.read_trial_tasks()
+        assert len(trial_tasks) == 1
+        assert trial_tasks[0].id == "trial-1"
+
+    def test_task_category_property(self, store: TaskStore) -> None:
+        success_task = make_task(outcome=Outcome.success)
+        assert success_task.category == "reference"
+        failed_task = make_task(outcome=Outcome.failed)
+        assert failed_task.category == "trial"
+
+    def test_write_updates_index(self, store: TaskStore) -> None:
+        task = make_task()
+        store.write_task(task)
         index = store.read_index()
-        assert index.lookup("test-sig-123") is not None
-
-    def test_write_replaces_existing(self, store: PatternStore) -> None:
-        p1 = make_pattern(id="p1", confidence=0.8)
-        store.write(p1)
-        p2 = make_pattern(id="p1", confidence=0.8, occurrences=5)
-        store.write(p2)
-        probabilistic = store._read_tier(Tier.probabilistic)
-        assert len(probabilistic) == 1
-        assert probabilistic[0].occurrences == 5
+        assert "login-page" in index.entries
 
 
-class TestStoreLookup:
-    def test_lookup_by_exact_signature(self, store: PatternStore) -> None:
-        p = make_pattern(signature="exact-sig")
-        store.write(p)
-        found = store.lookup("exact-sig")
-        assert found is not None
-        assert found.id == p.id
+class TestEvents:
+    def test_append_event(self, store: TaskStore) -> None:
+        evt = SkillEvent(skill_name="a2h-spec", phase=Phase.task)
+        store.append_event(evt)
+        events = store.read_events()
+        assert len(events) == 1
+        assert events[0].skill_name == "a2h-spec"
+        assert events[0].phase == Phase.task
 
-    def test_lookup_regex_match(self, store: PatternStore) -> None:
-        p = make_pattern(signature="error.*ValuesBucket")
-        store.write(p)
-        matches = store.lookup_by_error_text("error TS: arkts-identifiers-as-prop-names ValuesBucket")
-        assert len(matches) >= 1
-        assert matches[0].id == p.id
+    def test_read_empty_events(self, store: TaskStore) -> None:
+        events = store.read_events()
+        assert len(events) == 0
 
-    def test_lookup_nonexistent(self, store: PatternStore) -> None:
-        found = store.lookup("nonexistent-sig")
-        assert found is None
-
-
-class TestStorePromotion:
-    def test_promote_empirical_to_probabilistic(self, store: PatternStore) -> None:
-        p = make_pattern(id="p-emp", confidence=0.5)
-        store.write(p)
-        promoted = store.promote("p-emp")
-        assert promoted is not None
-        assert promoted.confidence == 0.7
-        assert promoted.tier == Tier.probabilistic
-
-        # Verify removed from empirical
-        empirical = store._read_tier(Tier.empirical)
-        assert not any(ep.id == "p-emp" for ep in empirical)
-
-        # Verify added to probabilistic
-        probabilistic = store._read_tier(Tier.probabilistic)
-        assert any(pp.id == "p-emp" for pp in probabilistic)
-
-    def test_promote_probabilistic_to_deterministic(self, store: PatternStore) -> None:
-        p = make_pattern(id="p-prob", confidence=0.8)
-        store.write(p)
-        promoted = store.promote("p-prob")
-        assert promoted is not None
-        assert promoted.confidence == 1.0
-        assert promoted.tier == Tier.deterministic
-        assert promoted.auto_apply is True
-
-    def test_promote_deterministic_no_change(self, store: PatternStore) -> None:
-        p = make_pattern(id="p-det", confidence=1.0)
-        store.write(p)
-        promoted = store.promote("p-det")
-        assert promoted is not None
-        assert promoted.confidence == 1.0
-
-    def test_promote_nonexistent(self, store: PatternStore) -> None:
-        result = store.promote("nonexistent")
-        assert result is None
-
-    def test_demote_to_empirical(self, store: PatternStore) -> None:
-        p = make_pattern(id="p-prob", confidence=0.8)
-        store.write(p)
-        demoted = store.demote("p-prob")
-        assert demoted is not None
-        assert demoted.confidence == 0.5
-        assert demoted.tier == Tier.empirical
+    def test_clear_events(self, store: TaskStore) -> None:
+        evt = SkillEvent(skill_name="a2h-spec")
+        store.append_event(evt)
+        store.clear_events()
+        assert len(store.read_events()) == 0
 
 
-class TestStoreCheckpointArchive:
-    def test_checkpoint(self, store: PatternStore) -> None:
-        p = make_pattern(id="p1")
-        store.checkpoint([p])
-        session_file = store.config.sessions_dir / "latest.json"
-        assert session_file.exists()
-        data = json.loads(session_file.read_text())
-        assert data["pending_count"] == 1
+class TestPhaseMapping:
+    def test_config_resolves_phase(self, tmp_config: MBMConfig) -> None:
+        assert tmp_config.resolve_phase("a2h-spec") == Phase.task
+        assert tmp_config.resolve_phase("a2h-plan") == Phase.plan
+        assert tmp_config.resolve_phase("a2h-execute") == Phase.execute
+        assert tmp_config.resolve_phase("a2h-verify") == Phase.verify
+        assert tmp_config.resolve_phase("unknown-skill") is None
 
-    def test_archive_deduplicates(self, store: PatternStore) -> None:
-        # Write two patterns with same id to empirical
-        p1 = make_pattern(id="dup-1", confidence=0.5)
-        p2 = make_pattern(id="dup-1", confidence=0.5, title="Updated title")
-        store.write(p1)
-        store.write(p2)
-        # Archive should deduplicate
+
+class TestCheckpointArchive:
+    def test_checkpoint(self, store: TaskStore) -> None:
+        evt = SkillEvent(skill_name="a2h-spec", phase=Phase.task)
+        store.append_event(evt)
+        store.checkpoint()
+        checkpoint_path = store.config.raw_dir / "checkpoint.json"
+        assert checkpoint_path.exists()
+
+    def test_archive_deduplicates(self, store: TaskStore) -> None:
+        # Write duplicate events
+        evt1 = SkillEvent(skill_name="a2h-spec", skill_args="same-args")
+        evt2 = SkillEvent(skill_name="a2h-spec", skill_args="same-args")
+        store.append_event(evt1)
+        store.append_event(evt2)
         store.archive()
-        empirical = store._read_tier(Tier.empirical)
-        # Only one should remain (or both if JSONL keeps both — implementation detail)
-        assert len(empirical) <= 2
+        events = store.read_events()
+        assert len(events) == 1  # deduplicated
+
+
+class TestLookupByFeature:
+    def test_find_by_feature_name(self, store: TaskStore) -> None:
+        task = make_task(feature="LoginActivity")
+        store.write_task(task)
+        results = store.lookup_by_feature("Login")
+        assert len(results) == 1
+        assert results[0].id == "login-page"
+
+    def test_find_no_match(self, store: TaskStore) -> None:
+        results = store.lookup_by_feature("NonexistentFeature")
+        assert len(results) == 0

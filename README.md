@@ -1,67 +1,63 @@
 # MigBotMemory
 
-Universal compilation error pattern cache with progressive disclosure for code migration tools.
+Task lifecycle memory for code migration — record the complete feature migration cycle, compress it, and reuse it.
 
 ## Quick Start
 
 ```bash
-# Install
 pip install migbot-memory
 
-# Initialize in your project
+# Initialize
 mbm init --domain android-to-harmonyos
 
-# Generate briefing (inject into session context)
+# Record a complete feature migration (task→plan→execute→verify→commit)
+mbm record \
+  --id login-page \
+  --feature LoginActivity \
+  --source LoginActivity.java \
+  --target LoginPage.ets \
+  --task-summary "迁移登录页面" \
+  --plan-summary "用Column+TextInput" \
+  --execute-summary "XML转Column" \
+  --verify-summary "编译通过" \
+  --outcome success \
+  --compile-pass true --verify-pass true
+
+# Search similar migrations
+mbm search LoginActivity
+
+# Generate briefing for session context injection
 mbm briefing --write
 
-# Write a new error pattern
-mbm write \
-  --signature "arkts-identifiers-as-prop-names.*ValuesBucket" \
-  --domain android-to-harmonyos \
-  --category syntax_error \
-  --title "ValuesBucket computed property names forbidden" \
-  --fix-strategy bracket_assignment \
-  --fix-before "let bucket = { [keyName]: value }" \
-  --fix-after "let bucket = {}; bucket[keyName] = value"
-
-# Lookup pattern details (LLM on-demand retrieval)
-mbm lookup "arkts-identifiers-as-prop-names"
-
-# Promote pattern after consistent fixes
-mbm promote android-to-harmonyos-arkts-identifiers-as-prop-names
-
-# List all patterns
-mbm list
+# Lookup full lifecycle details (lossless)
+mbm lookup login-page
 ```
 
 ## Integration with Claude Code
 
-Copy the hooks configuration into your project's `.claude/settings.json`:
+Add to project `.claude/settings.json`:
 
 ```json
 {
   "hooks": {
-    "SessionStart": [{"type": "command", "command": ".mbm/hooks/on_session_start.sh", "timeout": 10}],
-    "Stop": [{"type": "command", "command": ".mbm/hooks/on_stop.sh", "timeout": 5}],
-    "SessionEnd": [{"type": "command", "command": ".mbm/hooks/on_session_end.sh", "timeout": 15}]
+    "PostToolUse": [
+      {"type": "command", "command": ".mbm/hooks/on_skill_use.sh", "matcher": "Skill", "timeout": 3}
+    ],
+    "Stop": [
+      {"type": "command", "command": ".mbm/hooks/on_stop.sh", "timeout": 5}
+    ]
   }
 }
 ```
 
-Copy the hook scripts from `hooks/` into your project's `.mbm/hooks/` directory.
-
-## Progressive Disclosure
-
-Error patterns are stored in 3 tiers based on confidence:
-
-| Tier | Confidence | Injection Strategy | Token Budget |
-|---|---|---|---|
-| Deterministic | 1.0 | Always inject full fix | ≤500 |
-| Probabilistic | 0.7~0.99 | Inject on signature match | ≤1000 |
-| Empirical | 0.5~0.69 | On-demand via lookup | ≤2000 |
-
-Total budget ≤4000 tokens. Patterns promote automatically after consistent fixes.
+Copy hook scripts from `hooks/` into `.mbm/hooks/`.
 
 ## Architecture
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design document.
+
+**Key concepts:**
+- Memory unit = feature migration lifecycle (task→plan→execute→verify→commit)
+- 3-level compression: tool → session (split+summarize+index) → task
+- Task hooks = skill invocations (PostToolUse), not session boundaries
+- Quality-based categorization: reference (success) vs trial (partial/failed)

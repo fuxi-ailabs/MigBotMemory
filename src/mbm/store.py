@@ -1,319 +1,217 @@
-"""Pattern store — JSON file CRUD + index + promotion + atomic writes."""
+"""Pattern store — Task lifecycle storage with 3-level compression.
+
+Storage structure:
+  raw/events.jsonl        → tool compression layer (skill invocation events)
+  tasks/index.json         → session compression layer (index for fast lookup)
+  tasks/reference/*.json   → reference tasks (always injectable)
+  tasks/trial/*.json       → trial tasks (on lookup)
+"""
 
 from __future__ import annotations
 
 import json
-import re
-import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from .config import MBMConfig
-from .models import Category, FixTemplate, FixStrategy, IndexEntry, MappingEntry, Pattern, PatternIndex, Tier
+from .models import Outcome, Phase, QualityMetrics, SkillEvent, TaskIndex, TaskRecord
 
 
-class PatternStore:
-    """File-based pattern storage with atomic writes and tier promotion."""
+class TaskStore:
+    """File-based task lifecycle storage with atomic writes."""
 
     def __init__(self, config: MBMConfig) -> None:
         self.config = config
         self._ensure_dirs()
 
-    # ── Directory initialization ──────────────────────────────────
-
     def _ensure_dirs(self) -> None:
-        """Create .mbm directory structure if absent."""
-        for d in (self.config.patterns_dir, self.config.context_dir, self.config.sessions_dir):
+        for d in (
+            self.config.raw_dir,
+            self.config.reference_dir,
+            self.config.trial_dir,
+            self.config.context_dir,
+        ):
             d.mkdir(parents=True, exist_ok=True)
-
-    def init_store(self, seed_patterns: Optional[list[Pattern]] = None) -> None:
-        """Initialize empty store files and optionally seed deterministic patterns."""
-        for name in ("deterministic.json", "probabilistic.json"):
-            path = self.config.patterns_dir / name
-            if not path.exists():
-                self._atomic_write_json(path, [])
-
-        empirical_path = self.config.patterns_dir / "empirical.jsonl"
-        if not empirical_path.exists():
-            empirical_path.write_text("", encoding="utf-8")
-
-        mappings_path = self.config.patterns_dir / "mappings.json"
-        if not mappings_path.exists():
-            self._atomic_write_json(mappings_path, [])
-
-        index_path = self.config.patterns_dir / "index.json"
-        if not index_path.exists():
-            self._atomic_write_json(
-                index_path,
-                PatternIndex().model_dump(mode="json"),
-            )
-
-        # Seed patterns if provided
-        if seed_patterns:
-            for p in seed_patterns:
-                self.write(p)
 
     # ── Atomic write ──────────────────────────────────────────────
 
     def _atomic_write_json(self, path: Path, data: object) -> None:
-        """Write JSON with atomic .tmp → rename strategy."""
-        tmp_path = path.with_suffix(".tmp")
-        tmp_path.write_text(
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(
             json.dumps(data, ensure_ascii=False, indent=2, default=str),
             encoding="utf-8",
         )
-        tmp_path.replace(path)
+        tmp.replace(path)
 
-    def _atomic_append_jsonl(self, path: Path, pattern: Pattern) -> None:
-        """Append a single JSON line to JSONL file."""
-        line = pattern.model_dump_json() + "\n"
-        # For JSONL, atomicity is less critical (append-only), just write directly
-        path.write_text(
-            path.read_text(encoding="utf-8") + line,
-            encoding="utf-8",
-        )
+    # ── Tool compression: raw events ──────────────────────────────
 
-    # ── Read operations ───────────────────────────────────────────
+    def append_event(self, event: SkillEvent) -> None:
+        """Append a skill invocation event to raw/events.jsonl."""
+        path = self.config.raw_dir / "events.jsonl"
+        line = event.model_dump_json() + "\n"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
 
-    def _read_tier(self, tier: Tier) -> list[Pattern]:
-        """Read all patterns from a tier file."""
-        if tier == Tier.empirical:
-            return self._read_empirical()
-        filename = f"{tier.value}.json"
-        path = self.config.patterns_dir / filename
+    def read_events(self) -> list[SkillEvent]:
+        """Read all raw events."""
+        path = self.config.raw_dir / "events.jsonl"
         if not path.exists():
             return []
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return [Pattern.model_validate(p) for p in data]
-
-    def _read_empirical(self) -> list[Pattern]:
-        """Read all patterns from empirical.jsonl (append-only)."""
-        path = self.config.patterns_dir / "empirical.jsonl"
-        if not path.exists():
-            return []
-        lines = path.read_text(encoding="utf-8").strip().split("\n")
-        patterns = []
-        for line in lines:
+        events = []
+        for line in path.read_text(encoding="utf-8").strip().split("\n"):
             if line.strip():
                 try:
-                    patterns.append(Pattern.model_validate_json(line))
+                    events.append(SkillEvent.model_validate_json(line))
                 except Exception:
-                    continue  # skip malformed lines
-        return patterns
+                    continue
+        return events
 
-    def read_all(self) -> list[Pattern]:
-        """Read all patterns across all tiers."""
-        result = []
-        for tier in (Tier.deterministic, Tier.probabilistic, Tier.empirical):
-            result.extend(self._read_tier(tier))
-        return result
+    def clear_events(self) -> None:
+        """Clear raw events after processing."""
+        path = self.config.raw_dir / "events.jsonl"
+        if path.exists():
+            path.write_text("", encoding="utf-8")
 
-    def read_mappings(self) -> list[MappingEntry]:
-        """Read import/API replacement mappings."""
-        path = self.config.patterns_dir / "mappings.json"
-        if not path.exists():
-            return []
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return [MappingEntry.model_validate(m) for m in data]
+    # ── Task CRUD ─────────────────────────────────────────────────
 
-    def read_index(self) -> PatternIndex:
-        """Read the cross-tier index."""
-        path = self.config.patterns_dir / "index.json"
-        if not path.exists():
-            return PatternIndex()
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return PatternIndex.model_validate(data)
+    def write_task(self, task: TaskRecord) -> None:
+        """Write a task record to the appropriate category directory."""
+        # Determine category
+        category = task.category  # "reference" or "trial"
+        target_dir = self.config.reference_dir if category == "reference" else self.config.trial_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / f"{task.id}.json"
 
-    # ── Write operations ──────────────────────────────────────────
+        # If task was previously in a different category, remove old file
+        self._remove_task_file(task.id)
 
-    def write(self, pattern: Pattern) -> None:
-        """Write a pattern to the appropriate tier file and update index."""
-        tier = pattern.tier
-        if tier == Tier.empirical:
-            self._atomic_append_jsonl(
-                self.config.patterns_dir / "empirical.jsonl",
-                pattern,
-            )
-        else:
-            patterns = self._read_tier(tier)
-            # Replace if exists, else append
-            existing_idx = next(
-                (i for i, p in enumerate(patterns) if p.id == pattern.id),
-                None,
-            )
-            if existing_idx is not None:
-                patterns[existing_idx] = pattern
-            else:
-                patterns.append(pattern)
-            self._atomic_write_json(
-                self.config.patterns_dir / f"{tier.value}.json",
-                [p.model_dump(mode="json") for p in patterns],
-            )
+        self._atomic_write_json(path, task.model_dump(mode="json"))
 
         # Update index
         index = self.read_index()
-        index.upsert(pattern.signature, tier, pattern.id)
+        index.upsert(task.id, task.feature, task.outcome, task.quality)
         self._atomic_write_json(
-            self.config.patterns_dir / "index.json",
+            self.config.tasks_dir / "index.json",
             index.model_dump(mode="json"),
         )
 
-    def write_mapping(self, mapping: MappingEntry) -> None:
-        """Write a replacement mapping."""
-        mappings = self.read_mappings()
-        # Replace if old key exists, else append
-        existing_idx = next(
-            (i for i, m in enumerate(mappings) if m.old == mapping.old and m.domain == mapping.domain),
-            None,
-        )
-        if existing_idx is not None:
-            mappings[existing_idx] = mapping
-        else:
-            mappings.append(mapping)
-        self._atomic_write_json(
-            self.config.patterns_dir / "mappings.json",
-            [m.model_dump(mode="json") for m in mappings],
-        )
+    def _remove_task_file(self, task_id: str) -> None:
+        """Remove task file from whichever category directory it's in."""
+        for dir_path in (self.config.reference_dir, self.config.trial_dir):
+            path = dir_path / f"{task_id}.json"
+            if path.exists():
+                path.unlink()
 
-    # ── Lookup ────────────────────────────────────────────────────
-
-    def lookup(self, signature: str) -> Optional[Pattern]:
-        """Find a pattern by its signature regex."""
-        # First check index for exact match
-        index = self.read_index()
-        entry = index.lookup(signature)
-        if entry:
-            patterns = self._read_tier(entry.tier)
-            return next((p for p in patterns if p.id == entry.pattern_id), None)
-
-        # Fall back to regex matching across all tiers
-        for pattern in self.read_all():
-            try:
-                if re.search(pattern.signature, signature, re.IGNORECASE):
-                    return pattern
-            except re.error:
-                continue
-
+    def read_task(self, task_id: str) -> Optional[TaskRecord]:
+        """Read a task record by ID, searching both categories."""
+        for dir_path in (self.config.reference_dir, self.config.trial_dir):
+            path = dir_path / f"{task_id}.json"
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                return TaskRecord.model_validate(data)
         return None
 
-    def lookup_by_error_text(self, error_text: str) -> list[Pattern]:
-        """Find all patterns whose signature regex matches the given error text."""
-        matches = []
-        for pattern in self.read_all():
-            try:
-                if re.search(pattern.signature, error_text, re.IGNORECASE):
-                    matches.append(pattern)
-            except re.error:
+    def read_all_tasks(self) -> list[TaskRecord]:
+        """Read all task records from both categories."""
+        tasks = []
+        for dir_path in (self.config.reference_dir, self.config.trial_dir):
+            if not dir_path.exists():
                 continue
-        return matches
+            for path in dir_path.glob("*.json"):
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    tasks.append(TaskRecord.model_validate(data))
+                except Exception:
+                    continue
+        return tasks
 
-    # ── Promotion lifecycle ───────────────────────────────────────
+    def read_reference_tasks(self) -> list[TaskRecord]:
+        """Read only reference (success) tasks."""
+        tasks = []
+        if not self.config.reference_dir.exists():
+            return tasks
+        for path in self.config.reference_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                tasks.append(TaskRecord.model_validate(data))
+            except Exception:
+                continue
+        return tasks
 
-    def promote(self, pattern_id: str) -> Optional[Pattern]:
-        """Promote a pattern to the next tier."""
-        # Find the pattern across all tiers
-        current_pattern = None
-        current_tier = None
-        for tier in (Tier.deterministic, Tier.probabilistic, Tier.empirical):
-            patterns = self._read_tier(tier)
-            found = next((p for p in patterns if p.id == pattern_id), None)
-            if found:
-                current_pattern = found
-                current_tier = tier
-                break
+    def read_trial_tasks(self) -> list[TaskRecord]:
+        """Read only trial (partial/failed) tasks."""
+        tasks = []
+        if not self.config.trial_dir.exists():
+            return tasks
+        for path in self.config.trial_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                tasks.append(TaskRecord.model_validate(data))
+            except Exception:
+                continue
+        return tasks
 
-        if current_pattern is None:
-            return None
+    # ── Index (session compression) ──────────────────────────────
 
-        # Already at top tier
-        if current_pattern.confidence >= 1.0:
-            return current_pattern
+    def read_index(self) -> TaskIndex:
+        """Read the cross-category task index."""
+        path = self.config.tasks_dir / "index.json"
+        if not path.exists():
+            return TaskIndex()
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return TaskIndex.model_validate(data)
 
-        # Promote
-        promoted = current_pattern.promote()
-        new_tier = promoted.tier
+    # ── Lookup (search by feature, source, errors) ───────────────
 
-        # Remove from old tier
-        if current_tier == Tier.empirical:
-            self._remove_from_empirical(pattern_id)
-        else:
-            old_patterns = self._read_tier(current_tier)
-            old_patterns = [p for p in old_patterns if p.id != pattern_id]
-            self._atomic_write_json(
-                self.config.patterns_dir / f"{current_tier.value}.json",
-                [p.model_dump(mode="json") for p in old_patterns],
-            )
+    def lookup_by_feature(self, feature: str, domain: Optional[str] = None) -> list[TaskRecord]:
+        """Find tasks that migrated a similar feature."""
+        tasks = self.read_all_tasks()
+        if domain:
+            tasks = [t for t in tasks if t.domain == domain]
+        return [
+            t for t in tasks
+            if feature.lower() in t.feature.lower() or feature.lower() in t.source.lower()
+        ]
 
-        # Write to new tier
-        self.write(promoted)
-        return promoted
+    # ── Checkpoint (Stop hook) ───────────────────────────────────
 
-    def demote(self, pattern_id: str) -> Optional[Pattern]:
-        """Demote a pattern back to empirical (inconsistent fix detected)."""
-        current_pattern = None
-        current_tier = None
-        for tier in (Tier.deterministic, Tier.probabilistic):
-            patterns = self._read_tier(tier)
-            found = next((p for p in patterns if p.id == pattern_id), None)
-            if found:
-                current_pattern = found
-                current_tier = tier
-                break
+    def checkpoint(self) -> None:
+        """Process raw events into session-level summaries. Stop hook calls this."""
+        events = self.read_events()
+        if not events:
+            return
 
-        if current_pattern is None:
-            return None
+        # Group events by phase
+        phase_events: dict[Phase, list[SkillEvent]] = {}
+        for event in events:
+            if event.phase:
+                phase_events.setdefault(event.phase, []).append(event)
 
-        demoted = current_pattern.demote()
+        # Write checkpoint metadata
+        meta = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event_count": len(events),
+            "phases_seen": [p.value for p in phase_events.keys()],
+        }
+        self._atomic_write_json(self.config.raw_dir / "checkpoint.json", meta)
 
-        # Remove from old tier
-        old_patterns = self._read_tier(current_tier)
-        old_patterns = [p for p in old_patterns if p.id != pattern_id]
-        self._atomic_write_json(
-            self.config.patterns_dir / f"{current_tier.value}.json",
-            [p.model_dump(mode="json") for p in old_patterns],
-        )
-
-        # Write to empirical
-        self.write(demoted)
-        return demoted
-
-    def _remove_from_empirical(self, pattern_id: str) -> None:
-        """Remove a pattern from empirical.jsonl by rewriting the file."""
-        patterns = self._read_empirical()
-        patterns = [p for p in patterns if p.id != pattern_id]
-        path = self.config.patterns_dir / "empirical.jsonl"
-        content = "".join(p.model_dump_json() + "\n" for p in patterns)
-        path.write_text(content, encoding="utf-8")
-
-    # ── Checkpoint (Stop hook) ────────────────────────────────────
-
-    def checkpoint(self, pending: Optional[list[Pattern]] = None) -> None:
-        """Persist session state (pending patterns from current session)."""
-        if pending:
-            for p in pending:
-                self.write(p)
-        # Write session timestamp
-        import datetime
-        session_path = self.config.sessions_dir / "latest.json"
-        self._atomic_write_json(session_path, {
-            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "pending_count": len(pending) if pending else 0,
-        })
-
-    # ── Archive (SessionEnd hook) ─────────────────────────────────
+    # ── Archive (session end) ────────────────────────────────────
 
     def archive(self) -> None:
-        """Compact empirical.jsonl by deduplicating and removing stale entries."""
-        patterns = self._read_empirical()
-        # Deduplicate by id
-        seen_ids: set[str] = set()
-        deduped = []
-        for p in patterns:
-            if p.id not in seen_ids:
-                seen_ids.add(p.id)
-                deduped.append(p)
+        """Compact raw events after session end. Keeps index + task records intact."""
+        # Deduplicate events by same skill+args within a time window
+        events = self.read_events()
+        # Simple dedup: keep unique skill+args combinations
+        seen: set[str] = set()
+        unique: list[SkillEvent] = []
+        for e in events:
+            key = f"{e.skill_name}:{e.skill_args or ''}"
+            if key not in seen:
+                seen.add(key)
+                unique.append(e)
 
-        # Rewrite empirical.jsonl
-        path = self.config.patterns_dir / "empirical.jsonl"
-        content = "".join(p.model_dump_json() + "\n" for p in deduped)
+        # Rewrite events with only unique entries
+        path = self.config.raw_dir / "events.jsonl"
+        content = "".join(e.model_dump_json() + "\n" for e in unique)
         path.write_text(content, encoding="utf-8")

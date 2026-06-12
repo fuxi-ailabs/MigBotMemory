@@ -1,10 +1,11 @@
 {
   "hooks": {
-    "SessionStart": [
+    "PostToolUse": [
       {
         "type": "command",
-        "command": ".mbm/hooks/on_session_start.sh",
-        "timeout": 10
+        "command": ".mbm/hooks/on_skill_use.sh",
+        "matcher": "Skill",
+        "timeout": 3
       }
     ],
     "Stop": [
@@ -12,13 +13,6 @@
         "type": "command",
         "command": ".mbm/hooks/on_stop.sh",
         "timeout": 5
-      }
-    ],
-    "SessionEnd": [
-      {
-        "type": "command",
-        "command": ".mbm/hooks/on_session_end.sh",
-        "timeout": 15
       }
     ]
   }

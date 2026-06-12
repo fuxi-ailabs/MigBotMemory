@@ -1,7 +1,6 @@
 #!/bin/bash
 # MigBotMemory — Stop hook
-# Checkpoint session state after every Claude response
-# Lightweight (<50ms) — persists pending patterns
+# Processes raw skill events into session-level checkpoints
 
 set -e
 
@@ -13,5 +12,6 @@ if [ ! -d "$MBM_DIR" ]; then
 fi
 
 mbm checkpoint 2>/dev/null || true
+mbm briefing --write 2>/dev/null || true
 
 echo '{"continue":true,"suppressOutput":true}'

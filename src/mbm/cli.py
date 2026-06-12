@@ -12,24 +12,22 @@ import typer
 
 from .config import MBMConfig
 from .inject import BriefingGenerator
-from .models import Category, FixStrategy, FixTemplate, Pattern, Tier
-from .store import PatternStore
+from .models import Outcome, Phase, QualityMetrics, SkillEvent, TaskRecord
+from .store import TaskStore
 
 app = typer.Typer(
     name="mbm",
-    help="MigBotMemory — universal compilation error pattern cache",
+    help="MigBotMemory — task lifecycle memory for code migration",
     no_args_is_help=True,
 )
 
 
 def _load_config() -> MBMConfig:
-    """Load config from current working directory."""
     return MBMConfig.load(Path.cwd())
 
 
-def _load_store(config: MBMConfig) -> PatternStore:
-    """Load store with the given config."""
-    return PatternStore(config)
+def _load_store(config: MBMConfig) -> TaskStore:
+    return TaskStore(config)
 
 
 # ── init ──────────────────────────────────────────────────────────
@@ -37,13 +35,11 @@ def _load_store(config: MBMConfig) -> PatternStore:
 @app.command()
 def init(
     domain: str = typer.Option("default", help="Migration domain tag"),
-    mbm_dir: str = typer.Option(".mbm", help="Working directory (relative to project root)"),
 ) -> None:
-    """Initialize .mbm directory structure and config."""
-    config = MBMConfig(domain=domain, mbm_dir=str(Path.cwd() / mbm_dir))
+    """Initialize .mbm directory structure."""
+    config = MBMConfig(domain=domain, mbm_dir=str(Path.cwd() / ".mbm"))
     config.save()
-    store = PatternStore(config)
-    store.init_store()
+    store = _load_store(config)
     typer.echo(f"Initialized MigBotMemory at {config.root} (domain: {domain})")
 
 
@@ -51,165 +47,195 @@ def init(
 
 @app.command()
 def briefing(
-    domain: Optional[str] = typer.Option(None, help="Filter patterns by domain"),
+    domain: Optional[str] = typer.Option(None, help="Filter by domain"),
     write: bool = typer.Option(False, "--write", help="Write briefing.md to .mbm/context/"),
 ) -> None:
-    """Generate progressive disclosure briefing for session context injection."""
+    """Generate progressive disclosure briefing."""
     config = _load_config()
     store = _load_store(config)
-    generator = BriefingGenerator(store, config)
+    gen = BriefingGenerator(store, config)
 
     if write:
-        content = generator.generate_and_write(domain)
+        content = gen.generate_and_write(domain)
         typer.echo(f"Briefing written to {config.context_dir / 'briefing.md'}")
     else:
-        content = generator.generate(domain)
-        typer.echo(content)
+        typer.echo(gen.generate(domain))
 
 
-# ── write ─────────────────────────────────────────────────────────
+# ── record ────────────────────────────────────────────────────────
 
 @app.command()
-def write_pattern(
-    signature: str = typer.Option(..., help="Regex pattern for matching errors"),
+def record(
+    id: str = typer.Option(..., help="Task identifier"),
     domain: str = typer.Option("default", help="Migration domain"),
-    category: Category = typer.Option(..., help="Error category"),
-    title: str = typer.Option(..., help="Short description"),
-    facts: Optional[str] = typer.Option(None, help="JSON array of fact strings"),
-    fix_strategy: FixStrategy = typer.Option(..., help="Fix strategy"),
-    fix_before: str = typer.Option(..., help="Wrong code example"),
-    fix_after: str = typer.Option(..., help="Correct code example"),
-    fix_description: Optional[str] = typer.Option(None, help="Optional fix explanation"),
-    confidence: float = typer.Option(0.5, help="Pattern confidence (0.5=empirical, 0.7=probabilistic, 1.0=deterministic)"),
-    auto_apply: bool = typer.Option(False, help="Whether to auto-apply"),
-    occurrences: int = typer.Option(1, help="Number of times observed"),
+    feature: str = typer.Option(..., help="Feature name, e.g. 'LoginActivity'"),
+    source: str = typer.Option(..., help="Source file/component"),
+    target: str = typer.Option(..., help="Target file/component"),
+    task_summary: str = typer.Option("", help="What was defined"),
+    plan_summary: str = typer.Option("", help="Design decisions"),
+    execute_summary: str = typer.Option("", help="Implementation approach"),
+    verify_summary: str = typer.Option("", help="Verification results"),
+    commit_summary: str = typer.Option("", help="What was committed"),
+    key_decisions: Optional[str] = typer.Option(None, help="JSON array of key decisions"),
+    key_errors: Optional[str] = typer.Option(None, help="JSON array of key errors"),
+    key_fixes: Optional[str] = typer.Option(None, help="JSON array of key fixes"),
+    outcome: Outcome = typer.Option(Outcome.failed, help="Task outcome"),
+    compile_pass: bool = typer.Option(False, help="Did compilation pass?"),
+    lint_errors: int = typer.Option(0, help="Lint error count"),
+    test_pass: bool = typer.Option(False, help="Did tests pass?"),
+    verify_pass: bool = typer.Option(False, help="Did verification pass?"),
 ) -> None:
-    """Write a new pattern to the appropriate tier."""
+    """Record a complete feature migration lifecycle."""
     config = _load_config()
     store = _load_store(config)
 
-    # Generate pattern ID from signature + domain
-    import re as regex
-    id_slug = regex.sub(r"[^a-zA-Z0-9]", "-", signature.lower())[:40]
-    pattern_id = f"{domain}-{id_slug}"
-
-    facts_list = json.loads(facts) if facts else []
-
-    pattern = Pattern(
-        id=pattern_id,
-        signature=signature,
+    task = TaskRecord(
+        id=id,
         domain=domain,
-        category=category,
-        title=title,
-        facts=facts_list,
-        fix_template=FixTemplate(
-            strategy=fix_strategy,
-            before=fix_before,
-            after=fix_after,
-            description=fix_description,
+        feature=feature,
+        source=source,
+        target=target,
+        task_summary=task_summary,
+        plan_summary=plan_summary,
+        execute_summary=execute_summary,
+        verify_summary=verify_summary,
+        commit_summary=commit_summary,
+        key_decisions=json.loads(key_decisions) if key_decisions else [],
+        key_errors=json.loads(key_errors) if key_errors else [],
+        key_fixes=json.loads(key_fixes) if key_fixes else [],
+        outcome=outcome,
+        quality=QualityMetrics(
+            compile_pass=compile_pass,
+            lint_errors=lint_errors,
+            test_pass=test_pass,
+            verify_pass=verify_pass,
         ),
-        confidence=confidence,
-        occurrences=occurrences,
-        auto_apply=auto_apply,
+        completed_at=datetime.now(timezone.utc),
     )
 
-    store.write(pattern)
-    tier_name = pattern.tier.value
-    typer.echo(f"Pattern written: {pattern_id} → {tier_name} (confidence={confidence})")
+    store.write_task(task)
+    category = task.category
+    typer.echo(f"Task recorded: {id} → {category} (outcome={outcome.value})")
 
 
-# ── promote ───────────────────────────────────────────────────────
+# ── event ─────────────────────────────────────────────────────────
 
 @app.command()
-def promote(
-    pattern_id: str = typer.Argument(help="Pattern ID to promote"),
+def event(
+    skill_name: str = typer.Option(..., help="Skill name that was invoked"),
+    skill_args: Optional[str] = typer.Option(None, help="Skill arguments"),
+    output_summary: Optional[str] = typer.Option(None, help="Compressed output summary"),
 ) -> None:
-    """Promote a pattern to the next tier (empirical→probabilistic→deterministic)."""
+    """Record a skill invocation event (called by PostToolUse hook)."""
     config = _load_config()
     store = _load_store(config)
 
-    promoted = store.promote(pattern_id)
-    if promoted is None:
-        typer.echo(f"Pattern not found: {pattern_id}", err=True)
-        raise typer.Exit(1)
-    typer.echo(f"Promoted: {pattern_id} → {promoted.tier.value} (confidence={promoted.confidence})")
+    phase = config.resolve_phase(skill_name)
+
+    evt = SkillEvent(
+        skill_name=skill_name,
+        skill_args=skill_args,
+        phase=phase,
+        output_summary=output_summary,
+    )
+
+    store.append_event(evt)
+    phase_str = phase.value if phase else "unknown"
+    typer.echo(f"Event recorded: {skill_name} → phase={phase_str}")
 
 
 # ── lookup ────────────────────────────────────────────────────────
 
 @app.command()
 def lookup(
-    signature: str = typer.Argument(help="Error signature or text to search"),
+    task_id: str = typer.Argument(help="Task ID to look up"),
 ) -> None:
-    """Lookup pattern details by signature (LLM on-demand retrieval)."""
+    """Lookup full task lifecycle details (lossless, on-demand)."""
     config = _load_config()
     store = _load_store(config)
 
-    # Try exact index lookup first
-    pattern = store.lookup(signature)
-    if pattern is None:
-        # Try matching against error text
-        matches = store.lookup_by_error_text(signature)
-        if matches:
-            pattern = matches[0]
-        else:
-            typer.echo(f"No pattern found matching: {signature}", err=True)
-            raise typer.Exit(1)
+    task = store.read_task(task_id)
+    if task is None:
+        typer.echo(f"Task not found: {task_id}", err=True)
+        raise typer.Exit(1)
 
-    # Output full pattern details (lossless disclosure)
-    typer.echo(pattern.model_dump_json(indent=2))
+    typer.echo(task.model_dump_json(indent=2))
+
+
+# ── search ────────────────────────────────────────────────────────
+
+@app.command()
+def search(
+    feature: str = typer.Argument(help="Feature name to search for"),
+    domain: Optional[str] = typer.Option(None, help="Filter by domain"),
+) -> None:
+    """Search tasks by feature name."""
+    config = _load_config()
+    store = _load_store(config)
+
+    results = store.lookup_by_feature(feature, domain)
+    if not results:
+        typer.echo("No matching tasks found.")
+        return
+
+    for t in results:
+        typer.echo(
+            f"{t.id} | {t.category} | {t.outcome.value} | "
+            f"{t.source} → {t.target} | {t.feature}"
+        )
 
 
 # ── checkpoint ────────────────────────────────────────────────────
 
 @app.command()
 def checkpoint() -> None:
-    """Persist session state (Stop hook)."""
+    """Process raw events into session summaries (Stop hook)."""
     config = _load_config()
     store = _load_store(config)
     store.checkpoint()
-    typer.echo("Session checkpointed.")
+    typer.echo("Checkpointed.")
 
 
 # ── archive ───────────────────────────────────────────────────────
 
 @app.command()
 def archive() -> None:
-    """Compact and clean up pattern store (SessionEnd hook)."""
+    """Compact and deduplicate raw events (session end)."""
     config = _load_config()
     store = _load_store(config)
     store.archive()
-    typer.echo("Store archived and compacted.")
+    typer.echo("Archived.")
 
 
 # ── list ──────────────────────────────────────────────────────────
 
 @app.command(name="list")
-def list_patterns(
-    tier: Optional[Tier] = typer.Option(None, help="Filter by tier"),
+def list_tasks(
     domain: Optional[str] = typer.Option(None, help="Filter by domain"),
-    category: Optional[Category] = typer.Option(None, help="Filter by category"),
+    outcome: Optional[Outcome] = typer.Option(None, help="Filter by outcome"),
+    category: Optional[str] = typer.Option(None, help="Filter by category (reference/trial)"),
 ) -> None:
-    """List all patterns with optional filters."""
+    """List all tasks with optional filters."""
     config = _load_config()
     store = _load_store(config)
 
-    patterns = store.read_all()
-    if tier:
-        patterns = [p for p in patterns if p.tier == tier]
+    tasks = store.read_all_tasks()
     if domain:
-        patterns = [p for p in patterns if p.domain == domain]
+        tasks = [t for t in tasks if t.domain == domain]
+    if outcome:
+        tasks = [t for t in tasks if t.outcome == outcome]
     if category:
-        patterns = [p for p in patterns if p.category == category]
+        tasks = [t for t in tasks if t.category == category]
 
-    if not patterns:
-        typer.echo("No patterns found.")
+    if not tasks:
+        typer.echo("No tasks found.")
         return
 
-    for p in patterns:
+    for t in tasks:
         typer.echo(
-            f"{p.id} | {p.tier.value} | {p.category.value} | "
-            f"conf={p.confidence:.2f} | occ={p.occurrences} | {p.title}"
+            f"{t.id} | {t.category} | {t.outcome.value} | "
+            f"{t.feature} | {t.source} → {t.target} | "
+            f"compile={t.quality.compile_pass} lint={t.quality.lint_errors}"
         )
 
 
