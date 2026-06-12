@@ -1,0 +1,62 @@
+[
+  {
+    "id": "arkts-valuesbucket-bracket",
+    "signature": "arkts-identifiers-as-prop-names.*ValuesBucket",
+    "domain": "android-to-harmonyos",
+    "category": "syntax_error",
+    "title": "ArkTS computed property names forbidden in ValuesBucket",
+    "facts": [
+      "ValuesBucket 不允许 computed property names",
+      "用 bracket assignment: bucket['key'] = value 代替 {[key]: value}"
+    ],
+    "fix_template": {
+      "strategy": "bracket_assignment",
+      "before": "let bucket: ValuesBucket = { [keyName]: value }",
+      "after": "let bucket: ValuesBucket = {}\nbucket[keyName] = value",
+      "description": "ArkTS禁止computed property names，改为bracket赋值"
+    },
+    "confidence": 1.0,
+    "occurrences": 85,
+    "auto_apply": true
+  },
+  {
+    "id": "arkts-eventdata-double-cast",
+    "signature": "EventData.*type mismatch|double.*cast",
+    "domain": "android-to-harmonyos",
+    "category": "type_mismatch",
+    "title": "EventData requires two-step explicit cast",
+    "facts": [
+      "EventData 的数值需要两次显式类型转换",
+      "先 cast 到 number，再 cast 到目标类型"
+    ],
+    "fix_template": {
+      "strategy": "explicit_cast",
+      "before": "let result: number = data as number",
+      "after": "let result: number = Number(data as string)",
+      "description": "EventData需要两步cast: 先as string再Number()"
+    },
+    "confidence": 0.8,
+    "occurrences": 16,
+    "auto_apply": false
+  },
+  {
+    "id": "arkts-promptaction-color",
+    "signature": "promptAction.*button.*color.*type",
+    "domain": "android-to-harmonyos",
+    "category": "type_mismatch",
+    "title": "promptAction button color expects ResourceColor not hex string",
+    "facts": [
+      "promptAction 的 button color 参数需要 ResourceColor 类型",
+      "不能直接用 hex string，需要用 $r() 或 Color enum"
+    ],
+    "fix_template": {
+      "strategy": "explicit_cast",
+      "before": "buttonColor: '#FF0000'",
+      "after": "buttonColor: Color.Red",
+      "description": "buttonColor需要ResourceColor类型，用Color枚举代替hex string"
+    },
+    "confidence": 0.5,
+    "occurrences": 8,
+    "auto_apply": false
+  }
+]
