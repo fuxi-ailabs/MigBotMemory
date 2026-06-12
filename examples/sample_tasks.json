@@ -1,0 +1,36 @@
+[
+  {
+    "id": "login-page-migration",
+    "domain": "android-to-harmonyos",
+    "feature": "LoginActivity",
+    "source": "LoginActivity.java",
+    "target": "LoginPage.ets",
+    "task_summary": "迁移登录页面，保留表单验证和密码校验逻辑",
+    "plan_summary": "用 Column + TextInput 布局，验证逻辑提取为独立函数",
+    "execute_summary": "XML布局转Column组件，validation抽为pure function",
+    "verify_summary": "编译通过，静态分析0错误，视觉匹配95%",
+    "commit_summary": "5 files committed: 3 pages + 2 helpers",
+    "key_decisions": ["使用Column而非LinearLayout", "验证逻辑抽为pure function而非类方法"],
+    "key_errors": ["ValuesBucket computed property names被禁止", "EventData需要两步cast"],
+    "key_fixes": ["bracket assignment: bucket['key'] = value", "Number(data as string)两步cast"],
+    "outcome": "success",
+    "quality": {"compile_pass": true, "lint_errors": 0, "lint_warnings": 2, "test_pass": true, "verify_pass": true}
+  },
+  {
+    "id": "chat-page-migration",
+    "domain": "android-to-harmonyos",
+    "feature": "ChatActivity",
+    "source": "ChatActivity.java",
+    "target": "ChatPage.ets",
+    "task_summary": "迁移聊天页面，含RecyclerView列表和消息发送",
+    "plan_summary": "用 List + ListItem 替代RecyclerView，消息用LazyForEach",
+    "execute_summary": "转换布局但RecyclerView适配器不兼容ArkTS",
+    "verify_summary": "编译通过但功能不完整，RecyclerView适配器需重新设计",
+    "commit_summary": "3 files committed，功能部分缺失",
+    "key_decisions": ["尝试直接转换RecyclerView→List"],
+    "key_errors": ["RecyclerView.Adapter不兼容ArkTS", "LazyForEach数据源需要IDataSource接口"],
+    "key_fixes": ["改用BasicDataSource实现IDataSource", "adapter逻辑重写为组件内方法"],
+    "outcome": "partial",
+    "quality": {"compile_pass": true, "lint_errors": 5, "lint_warnings": 3, "test_pass": false, "verify_pass": false}
+  }
+]
